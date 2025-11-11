@@ -1,0 +1,10 @@
+base_url: "https://SEU-SERVIDOR/g5-senior-services"
+port: "sapiens_Synccom_senior_g5_co_mfi_prj_gerarorcamentofinanceirogrid"
+user: "usuario_ws"
+password: "senha_ws"
+encryption: 0
+tipOpe: 0
+codEmp: 1
+lctSup: 0
+recalculaTotalizadores: "S"
+timeout: 60
