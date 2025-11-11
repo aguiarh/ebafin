@@ -1,402 +1,299 @@
-import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import io, math, time
 from datetime import datetime
-from decimal import Decimal
-import streamlit as st
+import pandas as pd, requests, streamlit as st
+import xml.etree.ElementTree as ET
 
-st.set_page_config(page_title="NFS-e Espelho (Hotel)", layout="wide")
+# =========================
+# CONFIG FIXA (produção)
+# =========================
+ENDPOINT_SOAP = "https://web130.seniorcloud.com.br:30401/g5-senior-services/sapiens_Synccom_senior_g5_co_mfi_prj_gerarorcamentofinanceirogrid"
+ENCRYPTION = "0"                 # manter 0
+TIP_OPE = "0"                    # 0 = gera/acrescenta
+LCT_SUP = "1"                    # 1 = lanca nos superiores
+RECALCULA_TOTALIZADORES = "S"    # "S" ou "N"
+TIMEOUT = 60                     # segundos
+BATCH_SIZE = 200                 # tamanho do lote padrão
 
-st.title("📄 Espelho de NFS-e a partir de relatório de hospedagem")
-st.caption("Gera um HTML bem parecido com o modelo da prefeitura, mas marcado como espelho.")
+st.set_page_config(page_title="Importador de Orçamento - EBA", layout="wide")
+REQUIRED_COLUMNS = ["numPrj","mesAno","codFpj","ctaFin","codCcu","vlrCpf","vlrCxf"]
 
-BRASAO_URL = "https://www.boaesperanca.mg.gov.br/Arquitetura/Imagens/prefeitura/brasao.png"
+# -------------------------
+# Helpers
+# -------------------------
+def to_int(s):
+    if s is None: return None
+    s = str(s).strip()
+    if s == "" or s.lower() == "nan": return None
+    return int(s)
 
-# =============== HELPERS ===================
-def to_decimal(valor_str: str) -> Decimal:
-    if not valor_str:
-        return Decimal("0")
-    valor_str = valor_str.strip()
-    valor_str = valor_str.replace("R$", "").replace(".", "").replace(" ", "")
-    valor_str = valor_str.replace(",", ".")
+def normalize_decimal_str(s: str):
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "" or s.lower() == "nan":
+        return s
+    s = s.replace(".", "").replace(",", ".", 1)
+    return s
+
+def to_float(s):
+    if s is None: return None
+    s = str(s).strip()
+    if s == "" or s.lower() == "nan": return None
+    s = s.replace(".", "").replace(",", ".", 1)
+    return float(s)
+
+def fmt_mesano(s):
+    s = str(s).strip()
+    if "-" in s and len(s) == 7:
+        a, m = s.split("-")
+        return f"{m.zfill(2)}/{a}"
+    if "/" in s and len(s) == 7:
+        m, a = s.split("/")
+        return f"{m.zfill(2)}/{a}"
     try:
-        return Decimal(valor_str)
+        d = pd.to_datetime(s, dayfirst=True, errors="raise")
+        return f"{d.month:02d}/{d.year}"
     except Exception:
-        return Decimal("0")
+        return s
 
-def extrair_campo(texto: str, rotulo: str, sep=":") -> str:
-    padrao = rf"{re.escape(rotulo)}{sep}\s*(.*)"
-    m = re.search(padrao, texto)
-    return m.group(1).strip() if m else ""
+# -------------------------
+# Planilha
+# -------------------------
+def load_sheet(file, normalize_numbers=False):
+    name = getattr(file, "name", "")
+    if name.lower().endswith((".xlsx",".xls")):
+        df = pd.read_excel(file, dtype=str)
+    elif name.lower().endswith((".csv",".txt")):
+        df = pd.read_csv(file, dtype=str, sep=",")
+    else:
+        try:
+            df = pd.read_excel(file, dtype=str)
+        except Exception:
+            file.seek(0)
+            df = pd.read_csv(file, dtype=str, sep=",")
 
-def extrair_primeiro_valor(texto: str, rotulo: str) -> str:
-    m = re.search(rf"{rotulo}.*?(R\$ [0-9\.,]+)", texto, re.DOTALL)
-    return m.group(1) if m else "R$ 0,00"
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colunas obrigatórias ausentes: {missing}. Cabeçalho encontrado: {list(df.columns)}")
 
-def parse_relatorio(texto: str) -> dict:
-    hotel = texto.splitlines()[0].strip() if texto.strip() else "HOTEL NÃO INFORMADO"
-    cnpj_hotel = extrair_campo(texto, "CNPJ")
-    checkin = extrair_campo(texto, "Check-in")
-    checkout = extrair_campo(texto, "Check-out")
-    categoria = extrair_campo(texto, "Categoria")
-    tarifa = extrair_campo(texto, "Tarifa")
-    dias = extrair_campo(texto, "Dias hospedagem")
-    agenciador = extrair_campo(texto, "Agenciador")
+    df = df[REQUIRED_COLUMNS].copy()
 
-    # hóspede
-    hospede = "Hóspede não identificado"
-    m_hosp = re.search(r"Hóspede\s+([\wÀ-ÿ\s]+)", texto)
-    if m_hosp:
-        hospede = m_hosp.group(1).strip()
+    if normalize_numbers:
+        for col in ["vlrCpf", "vlrCxf"]:
+            if col in df.columns:
+                df[col] = df[col].map(normalize_decimal_str)
 
-    valor_diaria_str = extrair_primeiro_valor(texto, "Adulto")
-    taxa_str = extrair_primeiro_valor(texto, "Total Taxa")
-    total_conta_str = extrair_primeiro_valor(texto, "Total da conta")
+    df["numPrj"]  = df["numPrj"].map(to_int)
+    df["codFpj"]  = df["codFpj"].map(to_int)
+    df["ctaFin"]  = df["ctaFin"].map(to_int)
+    df["vlrCpf"]  = df["vlrCpf"].map(to_float).fillna(0.0)
+    df["vlrCxf"]  = df["vlrCxf"].map(to_float).fillna(0.0)
+    df["mesAno"]  = df["mesAno"].map(fmt_mesano)
+    return df
 
-    valor_diaria = to_decimal(valor_diaria_str)
-    taxa = to_decimal(taxa_str)
-    total = to_decimal(total_conta_str)
+# -------------------------
+# SOAP
+# -------------------------
+def build_item(row):
+    item = ET.Element("gridOrcamentos")
+    fields = [
+        ("numPrj", row.get("numPrj")),
+        ("mesAno", row.get("mesAno")),
+        ("codFpj", row.get("codFpj")),
+        ("ctaFin", row.get("ctaFin")),
+        ("codCcu", row.get("codCcu")),
+        ("vlrCpf", row.get("vlrCpf")),
+        ("vlrCxf", row.get("vlrCxf")),
+    ]
+    for tag, val in fields:
+        el = ET.SubElement(item, tag)
+        el.text = "" if val is None else str(val)
+    return item
 
+def build_envelope(cfg, rows):
+    ns_soap = "http://schemas.xmlsoap.org/soap/envelope/"
+    ns_ser  = "http://services.senior.com.br"
+
+    ET.register_namespace("soapenv", ns_soap)
+    ET.register_namespace("ser", ns_ser)
+
+    env  = ET.Element(f"{{{ns_soap}}}Envelope")
+    body = ET.SubElement(env, f"{{{ns_soap}}}Body")
+
+    op = ET.SubElement(body, f"{{{ns_ser}}}OrcarFinanceiroGrid")
+
+    el_user = ET.SubElement(op, "user");       el_user.text = str(cfg["user"])
+    el_pass = ET.SubElement(op, "password");   el_pass.text = str(cfg["password"])
+    el_enc  = ET.SubElement(op, "encryption"); el_enc.text  = str(cfg["encryption"])
+
+    params = ET.SubElement(op, "parameters")
+
+    tipOpe = ET.SubElement(params, "tipOpe"); tipOpe.text = str(cfg["tipOpe"])
+    codEmp = ET.SubElement(params, "codEmp"); codEmp.text = str(cfg["codEmp"])
+    lctSup = ET.SubElement(params, "lctSup"); lctSup.text = str(cfg["lctSup"])
+
+    for r in rows:
+        params.append(build_item(r))
+
+    recalc = ET.SubElement(params, "recalculaTotalizadores")
+    recalc.text = str(cfg["recalculaTotalizadores"])
+
+    xml_bytes = ET.tostring(env, encoding="utf-8", xml_declaration=True, method="xml")
+    return xml_bytes
+
+# -------------------------
+# HTTP
+# -------------------------
+def post_batch(endpoint, payload, timeout, retries=2, backoff=2.0):
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": ""
+    }
+    last_exc = None
+    for attempt in range(retries+1):
+        try:
+            resp = requests.post(endpoint, data=payload, headers=headers, timeout=timeout, verify=True)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(backoff*(attempt+1))
+            else:
+                raise last_exc
+
+# -------------------------
+# Parse
+# -------------------------
+def parse_response(content: bytes):
+    root = ET.fromstring(content)
+    def all_local(tag): return [e for e in root.iter() if e.tag.endswith(tag)]
+    resultado   = next((e.text for e in all_local("resultado")), None)
+    erro_exec   = next((e.text for e in all_local("erroExecucao")), None)
+    erros       = [e.text for e in all_local("msgErr") if e.text]
+    mensagem    = next((e.text for e in all_local("mensagem")), None)
+    faultstring = next((e.text for e in all_local("faultstring")), None)
     return {
-        "hotel": hotel,
-        "cnpj_hotel": cnpj_hotel,
-        "checkin": checkin,
-        "checkout": checkout,
-        "categoria": categoria,
-        "tarifa": tarifa,
-        "dias": dias,
-        "agenciador": agenciador,
-        "hospede": hospede,
-        "valor_diaria": valor_diaria,
-        "taxa": taxa,
-        "total": total,
+        "resultado": resultado,
+        "erro_execucao": erro_exec,
+        "grid_erros": erros,
+        "mensagem": mensagem or faultstring
     }
 
-def montar_nfse_fake(dados: dict, cod_servico: str, aliquota: float) -> dict:
-    agora = datetime.now()
-    numero_nfse = agora.strftime("%Y%m%d%H%M%S")
-    valor_servico = float(dados["total"])
-    iss = round(valor_servico * (aliquota / 100), 2)
-    codigo_verificacao = "BESP-" + agora.strftime("%H%M%S")
+# -------------------------
+# Execução em lotes
+# -------------------------
+def run_import(df, cfg, batch_size):
+    endpoint = cfg['endpoint_soap'].strip()
+    total = len(df)
+    log_rows = [["timestamp","lote","status","resultado","erro_execucao","msg","grid_erros"]]
+    ok_batches = 0
 
-    return {
-        "cabecalho": {
-            "prefeitura": "PREFEITURA MUNICIPAL DE BOA ESPERANÇA",
-            "secretaria": "SECRETARIA MUNICIPAL DE FINANÇAS",
-            "titulo": "NOTA FISCAL ELETRÔNICA DE SERVIÇO - NFS-e",
-            "brasao": BRASAO_URL,
-        },
-        "numero_nfse": numero_nfse,
-        "data_emissao": agora.strftime("%d/%m/%Y %H:%M:%S"),
-        "competencia": agora.strftime("%m/%Y"),
-        "codigo_verificacao": codigo_verificacao,
-        "prestador": {
-            "razao_social": dados["hotel"],
-            "nome_fantasia": dados["hotel"],
-            "cnpj": dados["cnpj_hotel"],
-            "endereco": "Calcedônia, 220, Jardim Alvorada",
-            "municipio": "Boa Esperança",
-            "uf": "MG",
-            "cep": "37170-000",
-            "email": "atendimento@jhspalacehotel.com.br",
-            "telefone": "(35) 3851-3379"
-        },
-        "tomador": {
-            "razao_social": dados["hospede"],
-            "cpf_cnpj": "",
-            "endereco": "",
-            "municipio": "Boa Esperança",
-            "uf": "MG",
-            "cep": "",
-            "email": "",
-            "telefone": ""
-        },
-        "servico": {
-            "descricao": (
-                f"HOSPEDAGEM - {dados['categoria']} - {dados['tarifa']} "
-                f"({dados['checkin']} a {dados['checkout']}) "
-                f"Agenciador: {dados['agenciador']}"
-            ),
-            "codigo_servico": cod_servico,
-            "quantidade": 1,
-            "valor_unitario": valor_servico,
-            "valor_total": valor_servico,
-            "aliquota": aliquota,
-            "valor_iss": iss,
-        },
-        "tributos": {
-            "ir": 0.00,
-            "pis": 0.00,
-            "cofins": 0.00,
-            "inss": 0.00,
-            "csll": 0.00
-        },
-        "valor_servico": valor_servico,
-        "iss": iss
-    }
+    progress = st.progress(0)
+    status_box = st.empty()
 
-def gerar_html_nfse(nf: dict) -> str:
-    s = nf["servico"]
-    trib = nf["tributos"]
-    brasao = nf["cabecalho"]["brasao"]
+    for i in range(0, total, batch_size):
+        lote_idx = i//batch_size + 1
+        chunk = df.iloc[i:i+batch_size].to_dict("records")
+        try:
+            payload = build_envelope(cfg, chunk)
+            resp = post_batch(endpoint, payload, timeout=int(cfg["timeout"]))
+            info = parse_response(resp.content)
 
-    # deixei o cabeçalho bem diferente e os blocos com faixa cinza
-    html = f"""
-    <html>
-    <head>
-        <meta charset="utf-8" />
-        <title>NFS-e (Espelho)</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #dfe3e6;
-                padding: 12px;
-            }}
-            .nf-container {{
-                background: #fff;
-                max-width: 900px;
-                margin: 0 auto;
-                border: 1px solid #000;
-                padding: 10px 12px 16px 12px;
-            }}
-            .header {{
-                display: grid;
-                grid-template-columns: 80px 1fr;
-                gap: 10px;
-                border-bottom: 2px solid #000;
-                margin-bottom: 8px;
-                align-items: center;
-            }}
-            .header img {{
-                width: 70px;
-            }}
-            .header-text {{
-                text-align: center;
-                line-height: 1.15;
-            }}
-            .header-text .org {{
-                font-size: 13px;
-            }}
-            .header-text .title {{
-                font-size: 15px;
-                font-weight: bold;
-                margin-top: 3px;
-            }}
-            .alerta {{
-                background: #ffe7e7;
-                color: #a00000;
-                border: 1px solid #c75555;
-                padding: 4px 6px;
-                font-size: 11px;
-                margin-bottom: 6px;
-                text-align: center;
-                font-weight: bold;
-            }}
-            .block-title {{
-                background: #e6e6e6;
-                font-weight: bold;
-                padding: 3px 4px;
-                font-size: 12px;
-                border: 1px solid #cfcfcf;
-                margin-top: 6px;
-            }}
-            .block {{
-                border: 1px solid #cfcfcf;
-                padding: 4px 6px;
-                font-size: 12px;
-            }}
-            .row-2 {{
-                display: flex;
-                gap: 6px;
-            }}
-            .col {{
-                flex: 1;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 12px;
-                margin-top: 4px;
-            }}
-            table th, table td {{
-                border: 1px solid #ccc;
-                padding: 3px;
-            }}
-            table th {{
-                background: #f3f3f3;
-            }}
-            .footer {{
-                margin-top: 10px;
-                font-size: 11px;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="nf-container">
-            <div class="header">
-                <img src="{brasao}" alt="Brasão">
-                <div class="header-text">
-                    <div class="org">{nf['cabecalho']['prefeitura']}</div>
-                    <div class="org">{nf['cabecalho']['secretaria']}</div>
-                    <div class="title">{nf['cabecalho']['titulo']}</div>
-                </div>
-            </div>
+            status = "OK"
+            if (info.get("resultado") or "").upper() != "OK" or info.get("erro_execucao"):
+                status = "ERRO"
 
-            <div class="alerta">ESPelho gerado pelo sistema do hotel. NÃO substitui a NFS-e oficial da Prefeitura.</div>
+            if status == "OK":
+                ok_batches += 1
 
-            <div class="block-title">Dados da NFS-e</div>
-            <div class="block">
-                <p><strong>Número da NFS-e:</strong> {nf['numero_nfse']}</p>
-                <p><strong>Data e Hora da Emissão:</strong> {nf['data_emissao']}</p>
-                <p><strong>Competência:</strong> {nf['competencia']}</p>
-                <p><strong>Código de Verificação:</strong> {nf['codigo_verificacao']}</p>
-            </div>
+            log_rows.append([
+                datetime.now().isoformat(timespec="seconds"),
+                lote_idx,
+                status,
+                info.get("resultado"),
+                info.get("erro_execucao"),
+                info.get("mensagem"),
+                " | ".join(info.get("grid_erros") or [])
+            ])
+            status_box.write(f"Lote {lote_idx}: {status} — resultado={info.get('resultado')} erro={info.get('erro_execucao')} msg={info.get('mensagem')}")
+        except Exception as e:
+            log_rows.append([datetime.now().isoformat(timespec="seconds"), lote_idx, "EXCEPTION", None, None, str(e), ""])
+            status_box.write(f"Lote {lote_idx}: EXCEPTION — {e}")
 
-            <div class="row-2">
-                <div class="col">
-                    <div class="block-title">Dados do Prestador de Serviço</div>
-                    <div class="block">
-                        <p><strong>Razão Social/Nome:</strong> {nf['prestador']['razao_social']}</p>
-                        <p><strong>CPF/CNPJ:</strong> {nf['prestador']['cnpj']}</p>
-                        <p><strong>Endereço:</strong> {nf['prestador']['endereco']}</p>
-                        <p><strong>Município:</strong> {nf['prestador']['municipio']} - {nf['prestador']['uf']}</p>
-                        <p><strong>CEP:</strong> {nf['prestador']['cep']}</p>
-                        <p><strong>Email:</strong> {nf['prestador']['email']}</p>
-                        <p><strong>Telefone:</strong> {nf['prestador']['telefone']}</p>
-                    </div>
-                </div>
-                <div class="col">
-                    <div class="block-title">Dados do Tomador de Serviço</div>
-                    <div class="block">
-                        <p><strong>Razão Social/Nome:</strong> {nf['tomador']['razao_social']}</p>
-                        <p><strong>CPF/CNPJ:</strong> {nf['tomador']['cpf_cnpj']}</p>
-                        <p><strong>Município:</strong> {nf['tomador']['municipio']} - {nf['tomador']['uf']}</p>
-                        <p><strong>CEP:</strong> {nf['tomador']['cep']}</p>
-                        <p><strong>Email:</strong> {nf['tomador']['email']}</p>
-                        <p><strong>Telefone:</strong> {nf['tomador']['telefone']}</p>
-                    </div>
-                </div>
-            </div>
+        progress.progress(min(i+batch_size, total)/total)
 
-            <div class="block-title">Descrição dos Serviços</div>
-            <div class="block">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Descrição</th>
-                            <th>Cód.</th>
-                            <th>Qtd</th>
-                            <th>Valor Unitário</th>
-                            <th>Valor do Serviço</th>
-                            <th>Base de Cálculo</th>
-                            <th>ISS (%)</th>
-                            <th>ISS (R$)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td>{s['descricao']}</td>
-                            <td>{s['codigo_servico']}</td>
-                            <td style="text-align:center;">{s['quantidade']}</td>
-                            <td style="text-align:right;">{s['valor_unitario']:.2f}</td>
-                            <td style="text-align:right;">{s['valor_total']:.2f}</td>
-                            <td style="text-align:right;">{s['valor_total']:.2f}</td>
-                            <td style="text-align:center;">{s['aliquota']:.2f}</td>
-                            <td style="text-align:right;">{s['valor_iss']:.2f}</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
+    return ok_batches, log_rows
 
-            <div class="block-title">Tributos Federais</div>
-            <div class="block">
-                <table>
-                    <tr>
-                        <th>IR</th><th>PIS/PASEP</th><th>COFINS</th><th>INSS</th><th>CSLL</th><th>Outras retenções</th>
-                    </tr>
-                    <tr>
-                        <td>R$ {trib['ir']:.2f}</td>
-                        <td>R$ {trib['pis']:.2f}</td>
-                        <td>R$ {trib['cofins']:.2f}</td>
-                        <td>R$ {trib['inss']:.2f}</td>
-                        <td>R$ {trib['csll']:.2f}</td>
-                        <td>R$ 0,00</td>
-                    </tr>
-                </table>
-            </div>
+# -------------------------
+# UI
+# -------------------------
+st.title("Importador de Orçamento - EBA - Senior ERP")
+st.caption("Produção: informe apenas usuário, senha, empresa e a planilha.")
 
-            <div class="block-title">Detalhamento de Valores - Prestador dos Serviços</div>
-            <div class="block">
-                <table>
-                    <tr>
-                        <td><strong>Valor dos Serviços R$</strong></td>
-                        <td style="text-align:right;">{nf['valor_servico']:.2f}</td>
-                    </tr>
-                    <tr>
-                        <td><strong>(-) ISS Retido / Substituído</strong></td>
-                        <td style="text-align:right;">0,00</td>
-                    </tr>
-                    <tr>
-                        <td><strong>(=) Valor Líquido R$</strong></td>
-                        <td style="text-align:right;">{nf['valor_servico']:.2f}</td>
-                    </tr>
-                </table>
-            </div>
+colA, colB = st.columns([2,1])
 
-            <div class="footer">
-                <p>Natureza da operação: Tributação no Município • Situação tributária do ISSQN: Normal • Local da prestação: Boa Esperança</p>
-                <p>Documento apenas para controle interno.</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return html
+with colA:
+    up = st.file_uploader("Planilha (XLSX/CSV)", type=["xlsx","xls","csv","txt"], accept_multiple_files=False)
+    if st.button("Baixar modelo de planilha"):
+        sample = pd.DataFrame([
+            {"numPrj":101,"mesAno":"07/2025","codFpj":1,"ctaFin":1002,"codCcu":"1002","vlrCpf":15000.00,"vlrCxf":0.00},
+            {"numPrj":101,"mesAno":"08/2025","codFpj":1,"ctaFin":1002,"codCcu":"1002","vlrCpf":20000.00,"vlrCxf":0.00},
+        ])
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as w:
+            sample.to_excel(w, index=False)
+        st.download_button("Download sample_orcamento.xlsx", data=bio.getvalue(), file_name="sample_orcamento.xlsx")
 
-# =============== SIDEBAR =====================
-with st.sidebar:
-    st.subheader("⚙️ Parâmetros")
-    cod_servico = st.text_input("Código do serviço", value="01.07")
-    aliquota = st.number_input("Alíquota (%)", value=3.00, step=0.5)
+with colB:
+    st.subheader("Acesso")
+    user = st.text_input("Usuário do WebService", "webservice")
+    password = st.text_input("Senha", "Agro@2024", type="password")
+    codEmp = st.text_input("Código da Empresa", "70")
 
-texto_relatorio = st.text_area(
-    "Cole aqui o relatório de hospedagem:",
-    height=250,
-    value="""JHS PALACE HOTEL
-CNPJ: 04.608.009/0001-30
-Check-in: 06/11/2025 13:50:14
-Check-out: 07/11/2025 12:00:00
-Dias hospedagem: 1
-Agenciador: BOOKING
-Hóspede
-Adriano Lima
+normalize_numbers = st.checkbox("Normalizar números (trocar , por .)", value=True)
 
-Adulto\t06/11/2025 13:50:14\t07/11/2025 13:05:00\tR$ 261,36\tR$ 0,00
-Total Taxa: R$ 0,03
-Total da conta\tR$ 261,39
-"""
-)
+if st.button("Validar planilha"):
+    if not up:
+        st.warning("Envie a planilha primeiro.")
+    else:
+        try:
+            df = load_sheet(up, normalize_numbers=normalize_numbers)
+            st.success(f"Planilha válida! Qtd de Registros: {len(df)}")
+            st.dataframe(df.head(10))
+        except Exception as e:
+            st.error(f"Erro ao carregar/validar planilha: {e}")
 
-col1, col2 = st.columns(2)
+if st.button("Executar importação"):
+    if not up:
+        st.warning("Envie a planilha primeiro.")
+    else:
+        try:
+            df = load_sheet(up, normalize_numbers=normalize_numbers)
+        except Exception as e:
+            st.error(f"Erro ao carregar/validar planilha: {e}")
+            st.stop()
 
-if st.button("Gerar NFS-e (espelho)"):
-    dados = parse_relatorio(texto_relatorio)
-    nf = montar_nfse_fake(dados, cod_servico, aliquota)
-    html = gerar_html_nfse(nf)
+        cfg = {
+            "endpoint_soap": ENDPOINT_SOAP,
+            "user": user,
+            "password": password,
+            "encryption": ENCRYPTION,
+            "tipOpe": TIP_OPE,
+            "codEmp": codEmp,
+            "lctSup": LCT_SUP,
+            "recalculaTotalizadores": RECALCULA_TOTALIZADORES,
+            "timeout": TIMEOUT,
+        }
 
-    with col1:
-        st.subheader("Dados interpretados do relatório")
-        st.json(dados)
-        st.subheader("NFS-e (dados)")
-        st.json(nf)
+        ok, log_rows = run_import(df, cfg, batch_size=BATCH_SIZE)
 
-    with col2:
-        st.subheader("Visual da NFS-e (espelho) v2")
-        st.components.v1.html(html, height=780, scrolling=True)
+        csv_buf = io.StringIO()
+        for row in log_rows:
+            csv_buf.write(";".join([str(x) if x is not None else "" for x in row])+"\n")
+        st.download_button("Baixar envio_log.csv", data=csv_buf.getvalue().encode("utf-8"), file_name="envio_log.csv")
 
-        st.download_button(
-            "⬇️ Baixar HTML da NFS-e",
-            data=html,
-            file_name=f"nfse_espelho_{nf['numero_nfse']}.html",
-            mime="text/html",
-        )
-else:
-    st.info("Cole o relatório e clique em **Gerar NFS-e (espelho)**.")
+        st.success(f"Concluído. Lotes OK: {ok}/{math.ceil(len(df)/BATCH_SIZE)}")
