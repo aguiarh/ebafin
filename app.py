@@ -1,12 +1,3 @@
-# EBAFIN – Importador de Orçamento Financeiro (Streamlit Cloud)
-
-Abaixo estão **todos os arquivos** para rodar no Streamlit Cloud: `app.py`, `requirements.txt` e `runtime.txt`. Incluí um **Painel de Diagnóstico** embutido (toggle no topo) pra checar se `openpyxl`/`pandas` estão realmente disponíveis no container e para listar arquivos do diretório.
-
----
-
-## app.py
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -110,7 +101,6 @@ def normalize_number_series(series):
         .astype(float)
     )
 
-
 def read_table(uploaded_file):
     """Lê arquivo enviado.
     Suporta: XLSX (se openpyxl disponível) e CSV/TXT (autodetect sep).
@@ -171,7 +161,6 @@ def read_table(uploaded_file):
 
     raise ValueError("Formato não suportado sem pandas. Envie CSV.")
 
-
 # -------------------------
 # XML builders
 # -------------------------
@@ -182,14 +171,12 @@ def _val_from_row(x, k):
         return ("" if pd.isna(x.get(k)) else str(x.get(k)))
     return str(x.get(k, ""))
 
-
 def build_item(row):
     item = ET.Element("orcamentoFinanceiroLista")
     for tag in REQUIRED_COLUMNS:
         el = ET.SubElement(item, tag)
         el.text = _val_from_row(row, tag)
     return item
-
 
 def build_envelope(cfg, rows):
     ns_soap = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -222,13 +209,11 @@ def build_envelope(cfg, rows):
 
     return ET.tostring(env, encoding="utf-8", xml_declaration=True)
 
-
 def post_batch(endpoint, payload, timeout=60):
     headers = {"Content-Type": "text/xml; charset=utf-8"}
     resp = requests.post(endpoint, data=payload, headers=headers, timeout=timeout, verify=True)
     resp.raise_for_status()
     return resp
-
 
 def parse_response(content: bytes):
     root = ET.fromstring(content)
@@ -249,12 +234,10 @@ def parse_response(content: bytes):
         "mensagem": mensagem or faultstring,
     }
 
-
 def df_to_records(df):
     if HAS_PANDAS:
         return df.to_dict("records")
     return df  # já é lista de dicts no fallback
-
 
 def run_import(df_like, cfg, batch_size, simulate=False):
     endpoint = cfg["endpoint_soap"].strip()
@@ -320,7 +303,6 @@ def run_import(df_like, cfg, batch_size, simulate=False):
 
     return ok_batches, log_rows, xml_outputs
 
-
 # =========================
 # UI – Colunas
 # =========================
@@ -357,8 +339,7 @@ with colA:
                 for r in sample_rows:
                     line = ";".join(str(r[c]) for c in REQUIRED_COLUMNS)
                     lines.append(line)
-                csv_bytes = ("
-".join(lines)).encode("utf-8")
+                csv_bytes = ("\n".join(lines)).encode("utf-8")
 
             st.warning("openpyxl indisponível: gerando CSV como alternativa.")
             st.download_button(
@@ -422,8 +403,7 @@ if st.button("Executar importação"):
         # gera CSV do log
         csv_buf = io.StringIO()
         for row in log_rows:
-            csv_buf.write(";".join([str(x) if x is not None else "" for x in row]) + "
-")
+            csv_buf.write(";".join([str(x) if x is not None else "" for x in row]) + "\n")
 
         st.download_button(
             "Baixar envio_log.csv",
@@ -451,35 +431,3 @@ if st.button("Executar importação"):
                 "Se aparecer erro de conexão aqui no Cloud, teste o mesmo XML dentro da sua rede Senior. "
                 "Alguns ambientes não aceitam tráfego externo/porta 30401."
             )
-```
-
-text
-streamlit==1.37.1
-pandas==2.2.2
-numpy==1.26.4
-requests==2.32.3
-PyYAML==6.0.2
-openpyxl==3.1.5
-
-````
-
-> Incluí `numpy` explicitamente (o `pandas` puxa, mas ajuda o resolver do Cloud) e mantive `openpyxl`.
-
----
-
-## runtime.txt (opcional)
-
-```text
-python-3.12.3
-````
-
-Se o Cloud continuar mostrando Python 3.13.9 no log, tudo bem – o `requirements.txt` acima já é compatível.
-
----
-
-### Checklist rápido
-
-* Commit e push destes **3 arquivos** na raiz do repo.
-* *Manage app → Restart* no Streamlit Cloud.
-* Ative o **“🔎 Mostrar Painel de Diagnóstico”** na página e confira se `openpyxl` aparece na lista de pacotes.
-* Se não aparecer: o Cloud está usando outro `requirements.txt` (pasta errada, nome diferente) – verifique caminho/branch.
