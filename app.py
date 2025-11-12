@@ -294,20 +294,25 @@ if st.button("Validar planilha"):
     else:
         try:
             df_like = read_table(up)
-            st.success(f"Planilha válida! Registros: {len(df_like)}")
-            (st.dataframe(df_like.head(10)) if HAS_PANDAS else st.json(df_like[:5]))
+
+            # --- Normaliza para DataFrame "puro" (evita Styler/_repr_html_) ---
+            from pandas.io.formats.style import Styler
+            if isinstance(df_like, Styler):
+                df_preview = df_like.data
+            else:
+                df_preview = df_like
+
+            # Garante DataFrame mesmo que venha lista de dicts (fallback)
+            import pandas as pd
+            if not isinstance(df_preview, pd.DataFrame):
+                df_preview = pd.DataFrame(df_preview)
+
+            st.success(f"Planilha válida! Registros: {len(df_preview)}")
+            st.dataframe(df_preview.head(10), use_container_width=True)
+
         except Exception as e:
             st.error(f"Erro ao carregar/validar planilha: {e}")
 
-if st.button("Executar importação"):
-    if not up:
-        st.warning("Envie a planilha primeiro.")
-    else:
-        try:
-            df_like = read_table(up)
-        except Exception as e:
-            st.error(f"Erro ao carregar/validar planilha: {e}")
-            st.stop()
 
         cfg = {
             "endpoint_soap": ENDPOINT_SOAP,
