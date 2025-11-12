@@ -288,6 +288,8 @@ normalize_numbers = st.checkbox("Normalizar números (trocar , por .)", value=Tr
 # =========================
 # Ações
 # =========================
+
+# --- Botão 1: Validar planilha (prévia) ---
 if st.button("Validar planilha"):
     if not up:
         st.warning("Envie a planilha primeiro.")
@@ -303,7 +305,6 @@ if st.button("Validar planilha"):
                 df_preview = df_like
 
             # Garante DataFrame mesmo que venha lista de dicts (fallback)
-            import pandas as pd
             if not isinstance(df_preview, pd.DataFrame):
                 df_preview = pd.DataFrame(df_preview)
 
@@ -313,32 +314,64 @@ if st.button("Validar planilha"):
         except Exception as e:
             st.error(f"Erro ao carregar/validar planilha: {e}")
 
+st.divider()
+
+# --- Botão 2: Executar importação (WS ou simulado) ---
+if st.button("Executar importação"):
+    if not up:
+        st.warning("Envie a planilha primeiro.")
+    else:
+        try:
+            df_like = read_table(up)  # lê de novo para garantir o objeto em memória
+        except Exception as e:
+            st.error(f"Erro ao carregar/validar planilha: {e}")
+            st.stop()
 
         cfg = {
             "endpoint_soap": ENDPOINT_SOAP,
-            "user": user, "password": password,
-            "encryption": ENCRYPTION, "tipOpe": TIP_OPE,
-            "codEmp": codEmp, "lctSup": LCT_SUP,
+            "user": user,
+            "password": password,
+            "encryption": ENCRYPTION,
+            "tipOpe": TIP_OPE,
+            "codEmp": codEmp,
+            "lctSup": LCT_SUP,
             "recalculaTotalizadores": RECALCULA_TOTALIZADORES,
             "timeout": TIMEOUT,
         }
 
-        ok, log_rows, xml_outputs = run_import(df_like, cfg, batch_size=BATCH_SIZE, simulate=simulate)
+        ok, log_rows, xml_outputs = run_import(
+            df_like, cfg, batch_size=BATCH_SIZE, simulate=simulate
+        )
 
         # Log CSV
         csv_buf = io.StringIO()
         for row in log_rows:
             csv_buf.write(";".join([str(x) if x is not None else "" for x in row]) + "\n")
-        st.download_button("Baixar envio_log.csv", data=csv_buf.getvalue().encode("utf-8"), file_name="envio_log.csv")
 
-        st.success(f"Concluído. Lotes {'simulados' if simulate else 'OK'}: {ok}/{math.ceil(len(df_to_records(df_like)) / BATCH_SIZE)}")
+        st.download_button(
+            "Baixar envio_log.csv",
+            data=csv_buf.getvalue().encode("utf-8"),
+            file_name="envio_log.csv",
+        )
+
+        st.success(
+            f"Concluído. Lotes {'simulados' if simulate else 'OK'}: "
+            f"{ok}/{math.ceil(len(df_to_records(df_like)) / BATCH_SIZE)}"
+        )
 
         if simulate and xml_outputs:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
                 for num_lote, xml_bytes in xml_outputs:
                     zf.writestr(f"lote_{num_lote:03d}.xml", xml_bytes)
-            st.download_button("Baixar XMLs (ZIP)", data=zip_buf.getvalue(), file_name="lotes_xml.zip", mime="application/zip")
+            st.download_button(
+                "Baixar XMLs (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name="lotes_xml.zip",
+                mime="application/zip",
+            )
 
         if not simulate:
-            st.info("Se der erro de conexão no Cloud, teste o mesmo XML de dentro da rede Senior (porta 30401).")
+            st.info(
+                "Se der erro de conexão no Cloud, teste o mesmo XML de dentro da rede Senior (porta 30401)."
+            )
