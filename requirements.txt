@@ -1,6 +1,8 @@
+# requirements.txt – versão segura p/ Python 3.13
 streamlit==1.37.1
 pandas==2.2.2
-numpy==1.26.4
 requests==2.32.3
 PyYAML==6.0.2
 openpyxl==3.1.5
+# Remova a linha do numpy antigo OU use:
+# numpy>=2.1.3
