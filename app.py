@@ -1,13 +1,25 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-EBAFIN – Importador de Orçamento Financeiro (Senior ERP)
-- Layout: Upload à esquerda, Acesso à direita
-- Painel de diagnóstico embutido
-- Fallback CSV quando openpyxl não está disponível
-- "Modo simulado" para gerar/baixar os XMLs em vez de enviar (útil no Streamlit Cloud)
-- Auto-instalação de openpyxl em runtime (quando possível)
-"""
+import streamlit as st, traceback, sys, platform
+st.set_page_config(page_title="Importador de Orçamento – EBAFIN", layout="wide")
+st.title("Importador de Orçamento – EBAFIN (Senior ERP)")
+
+# Mostra diagnóstico mínimo já na UI:
+st.caption(f"Python: {sys.version} | Plataforma: {platform.platform()}")
+
+try:
+    import pandas as pd
+    import numpy as np
+    try:
+        import openpyxl  # garante import
+    except Exception:
+        # tenta instalar em runtime como último recurso
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl==3.1.5"])
+        import openpyxl
+except Exception:
+    st.error("Falha ao importar dependências. Traceback abaixo:")
+    st.code(traceback.format_exc())
+    st.stop()
+
 import io
 import os
 import sys
