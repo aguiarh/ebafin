@@ -1,17 +1,22 @@
-import streamlit as st, traceback, sys, platform
-st.set_page_config(page_title="Importador de Orçamento – EBAFIN", layout="wide")
-st.title("Importador de Orçamento – EBAFIN (Senior ERP)")
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# Mostra diagnóstico mínimo já na UI:
+# ===== ORDEM IMPORTANTE =====
+import sys, platform, traceback
+import streamlit as st
+st.set_page_config(page_title="Importador de Orçamento – EBAFIN", layout="wide")
+
+# Cabeçalho mínimo
+st.title("Importador de Orçamento – EBAFIN (Senior ERP)")
 st.caption(f"Python: {sys.version} | Plataforma: {platform.platform()}")
 
+# --- Garantir dependências principais ---
 try:
     import pandas as pd
     import numpy as np
     try:
         import openpyxl  # garante import
     except Exception:
-        # tenta instalar em runtime como último recurso
         import subprocess
         subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl==3.1.5"])
         import openpyxl
@@ -20,22 +25,13 @@ except Exception:
     st.code(traceback.format_exc())
     st.stop()
 
-import io
-import os
-import sys
-import platform
-import math
+# ===== Imports restantes (ok após page_config) =====
+import io, os, math, zipfile
 from datetime import datetime
-from pathlib import Path
 import xml.etree.ElementTree as ET
-import zipfile
-
-import streamlit as st
 import requests
 
-# ---------------- Garantia de ambiente (apenas p/ Cloud) ----------------
-# Tenta instalar openpyxl em runtime caso não esteja presente
-
+# ---------------- Garantia de ambiente extra (Cloud) ----------------
 def _ensure(pkg, ver=None):
     try:
         __import__(pkg)
@@ -52,45 +48,28 @@ def _ensure(pkg, ver=None):
             return False
 
 HAS_OPENPYXL = _ensure("openpyxl", "3.1.5")
-
-# pandas costuma já estar, mas garantimos import amigável
-try:
-    import pandas as pd  # type: ignore
-    HAS_PANDAS = True
-except Exception as e:
-    HAS_PANDAS = False
-    st.error("Pandas não disponível no servidor. Envie CSV simples (.csv/.txt) ou ajuste requirements.txt")
+HAS_PANDAS = True  # já importado acima; se falhar, paramos no try/except
 
 # =========================
 # CONFIG FIXA (produção)
 # =========================
-# ATENÇÃO: Use o endpoint REAL, sem "..." no meio da URL
 ENDPOINT_SOAP = (
     "https://web130.seniorcloud.com.br:30401/"
     "g5-senior-services/sapiens_Synccom_senior_g5_co_mfi_prj_gerarorcamentofinanceirogrid"
 )
+ENCRYPTION = "0"
+TIP_OPE = "0"
+LCT_SUP = "1"
+RECALCULA_TOTALIZADORES = "S"
+TIMEOUT = 60
+BATCH_SIZE = 50
 
-ENCRYPTION = "0"                 # manter 0
-TIP_OPE = "0"                    # 0 = gera/acrescenta
-LCT_SUP = "1"                    # 1 = lança nos superiores
-RECALCULA_TOTALIZADORES = "S"    # "S" ou "N"
-TIMEOUT = 60                      # segundos
-BATCH_SIZE = 50                   # quantas linhas por chamada
-
-REQUIRED_COLUMNS = [
-    "numPrj", "mesAno", "codFpj", "ctaFin", "codCcu", "vlrCpf", "vlrCxf"
-]
+REQUIRED_COLUMNS = ["numPrj", "mesAno", "codFpj", "ctaFin", "codCcu", "vlrCpf", "vlrCxf"]
 
 # =========================
-# UI – Cabeçalho
+# Painel de Diagnóstico
 # =========================
-st.set_page_config(page_title="Importador de Orçamento – EBAFIN", layout="wide")
-st.title("Importador de Orçamento – EBAFIN (Senior ERP)")
-st.caption("Produção: informe usuário, senha, empresa e a planilha. Upload à esquerda, acesso à direita.")
-
 with st.expander("🔎 Painel de Diagnóstico", expanded=False):
-    st.write("Python:", sys.version)
-    st.write("Plataforma:", platform.platform())
     st.write("HAS_PANDAS:", HAS_PANDAS, "HAS_OPENPYXL:", HAS_OPENPYXL)
     st.write("Arquivos no diretório:", os.listdir("."))
     try:
@@ -103,9 +82,7 @@ with st.expander("🔎 Painel de Diagnóstico", expanded=False):
 # =========================
 # Helpers
 # =========================
-
 def normalize_number_series(series):
-    # Converte strings com separador de milhar/decimal BR para float
     return (
         series.astype(str)
         .str.replace(".", "", regex=False)
@@ -114,10 +91,8 @@ def normalize_number_series(series):
     )
 
 def read_table(uploaded_file):
-    """Lê arquivo enviado.
-    Suporta: XLSX (se openpyxl disponível) e CSV/TXT (autodetect sep).
-    Retorna DataFrame-like (pandas) ou lista de dicts (fallback sem pandas).
-    """
+    """Lê XLSX (se openpyxl disponível) ou CSV/TXT (auto-sep).
+       Retorna DataFrame ou lista de dicts (fallback)."""
     if uploaded_file is None:
         raise ValueError("Nenhum arquivo enviado.")
 
@@ -126,10 +101,7 @@ def read_table(uploaded_file):
     if HAS_PANDAS:
         if name.endswith((".xlsx", ".xls")):
             if not HAS_OPENPYXL:
-                raise ValueError(
-                    "Arquivo Excel enviado, mas openpyxl não está disponível. "
-                    "Instale openpyxl no requirements.txt ou envie CSV."
-                )
+                raise ValueError("Arquivo Excel enviado, mas openpyxl não está disponível. Envie CSV ou ajuste requirements.")
             df = pd.read_excel(uploaded_file)
         elif name.endswith((".csv", ".txt")):
             df = pd.read_csv(uploaded_file, sep=None, engine="python")
@@ -141,30 +113,26 @@ def read_table(uploaded_file):
         if miss:
             raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(miss)}")
 
-        # normaliza valores numéricos
         for col in ("vlrCpf", "vlrCxf"):
             if col in df.columns:
-                try:
-                    df[col] = normalize_number_series(df[col])
-                except Exception:
-                    pass
+                try: df[col] = normalize_number_series(df[col])
+                except: pass
         return df
 
-    # Fallback sem pandas – lê como CSV simples (separador ; ou ,)
+    # Fallback sem pandas – CSV/TXT simples
     if name.endswith((".csv", ".txt")):
         text = uploaded_file.read().decode("utf-8", errors="ignore")
-        sep = ";" if ";" in text.splitlines()[0] else ","
+        first = next((l for l in text.splitlines() if l.strip()), "")
+        sep = ";" if ";" in first else ","
         lines = [l for l in text.splitlines() if l.strip()]
         header = [h.strip() for h in lines[0].split(sep)]
         rows = []
         for line in lines[1:]:
             parts = [p.strip() for p in line.split(sep)]
             rows.append(dict(zip(header, parts)))
-        # valida colunas
         miss = [c for c in REQUIRED_COLUMNS if c not in header]
         if miss:
             raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(miss)}")
-        # normaliza números
         for r in rows:
             for col in ("vlrCpf", "vlrCxf"):
                 if col in r and r[col] not in (None, ""):
@@ -176,12 +144,8 @@ def read_table(uploaded_file):
 # -------------------------
 # XML builders
 # -------------------------
-
 def _val_from_row(x, k):
-    if HAS_PANDAS:
-        import pandas as pd  # local
-        return ("" if pd.isna(x.get(k)) else str(x.get(k)))
-    return str(x.get(k, ""))
+    return ("" if pd.isna(x.get(k)) else str(x.get(k))) if HAS_PANDAS else str(x.get(k, ""))
 
 def build_item(row):
     item = ET.Element("orcamentoFinanceiroLista")
@@ -193,7 +157,6 @@ def build_item(row):
 def build_envelope(cfg, rows):
     ns_soap = "http://schemas.xmlsoap.org/soap/envelope/"
     ns_ser = "http://services.senior.com.br"
-
     ET.register_namespace("soapenv", ns_soap)
     ET.register_namespace("ser", ns_ser)
 
@@ -201,7 +164,6 @@ def build_envelope(cfg, rows):
     body = ET.SubElement(env, f"{{{ns_soap}}}Body")
     req = ET.SubElement(body, f"{{{ns_ser}}}gerarorcamentofinanceirogrid")
 
-    # header
     for tag, val in (
         ("user", cfg["user"]),
         ("password", cfg["password"]),
@@ -211,10 +173,8 @@ def build_envelope(cfg, rows):
         ("lctSup", cfg["lctSup"]),
         ("recalculaTotalizadores", cfg["recalculaTotalizadores"]),
     ):
-        el = ET.SubElement(req, tag)
-        el.text = str(val)
+        ET.SubElement(req, tag).text = str(val)
 
-    # lista
     lista = ET.SubElement(req, "orcamentoFinanceiroLista")
     for r in rows:
         lista.append(build_item(r))
@@ -229,86 +189,55 @@ def post_batch(endpoint, payload, timeout=60):
 
 def parse_response(content: bytes):
     root = ET.fromstring(content)
-
-    def all_local(tag):
-        return [e for e in root.iter() if e.tag.endswith(tag)]
-
-    resultado = next((e.text for e in all_local("resultado")), None)
-    erro_exec = next((e.text for e in all_local("erroExecucao")), None)
-    erros = [e.text for e in all_local("msgErr") if e.text]
-    mensagem = next((e.text for e in all_local("mensagem")), None)
-    faultstring = next((e.text for e in all_local("faultstring")), None)
-
+    def all_local(tag): return [e for e in root.iter() if e.tag.endswith(tag)]
     return {
-        "resultado": resultado,
-        "erro_execucao": erro_exec,
-        "grid_erros": erros,
-        "mensagem": mensagem or faultstring,
+        "resultado":      next((e.text for e in all_local("resultado")), None),
+        "erro_execucao":  next((e.text for e in all_local("erroExecucao")), None),
+        "grid_erros":     [e.text for e in all_local("msgErr") if e.text],
+        "mensagem":       next((e.text for e in all_local("mensagem")), None) or
+                          next((e.text for e in all_local("faultstring")), None),
     }
 
 def df_to_records(df):
-    if HAS_PANDAS:
-        return df.to_dict("records")
-    return df  # já é lista de dicts no fallback
+    return df.to_dict("records") if HAS_PANDAS else df
 
 def run_import(df_like, cfg, batch_size, simulate=False):
     endpoint = cfg["endpoint_soap"].strip()
     records = df_to_records(df_like)
     total = len(records)
 
-    log_rows = [[
-        "timestamp", "lote", "status", "resultado", "erro_execucao", "msg", "grid_erros"
-    ]]
+    log_rows = [["timestamp", "lote", "status", "resultado", "erro_execucao", "msg", "grid_erros"]]
     ok_batches = 0
-
     progress = st.progress(0)
     status_box = st.empty()
-
-    # buffer para XMLs (modo simulado)
     xml_outputs = []
 
     for i in range(0, total, batch_size):
         lote_idx = i // batch_size + 1
         chunk = records[i : i + batch_size]
-
         try:
             payload = build_envelope(cfg, chunk)
-
             if simulate:
-                # guarda para download e considera OK
                 xml_outputs.append((lote_idx, payload))
                 status = "OK"
-                info = {"resultado": "OK", "erro_execucao": None, "mensagem": "SIMULADO", "grid_erros": []}
+                info = {"resultado":"OK","erro_execucao":None,"mensagem":"SIMULADO","grid_erros":[]}
             else:
                 resp = post_batch(endpoint, payload, timeout=int(cfg["timeout"]))
                 info = parse_response(resp.content)
-                status = "OK"
-                if (info.get("resultado") or "").upper() != "OK" or info.get("erro_execucao"):
-                    status = "ERRO"
+                status = "OK" if (info.get("resultado") or "").upper() == "OK" and not info.get("erro_execucao") else "ERRO"
 
             if status == "OK":
                 ok_batches += 1
 
             log_rows.append([
                 datetime.now().isoformat(timespec="seconds"),
-                lote_idx,
-                status,
-                info.get("resultado"),
-                info.get("erro_execucao"),
-                info.get("mensagem"),
+                lote_idx, status, info.get("resultado"),
+                info.get("erro_execucao"), info.get("mensagem"),
                 " | ".join(info.get("grid_erros") or []),
             ])
             status_box.info(f"Lote {lote_idx} {'simulado' if simulate else 'enviado'}.")
         except Exception as e:
-            log_rows.append([
-                datetime.now().isoformat(timespec="seconds"),
-                lote_idx,
-                "EXCEPTION",
-                "",
-                "",
-                str(e),
-                "",
-            ])
+            log_rows.append([datetime.now().isoformat(timespec="seconds"), lote_idx, "EXCEPTION", "", "", str(e), ""])
             status_box.error(f"Erro no lote {lote_idx}: {e}")
 
         progress.progress(min(i + batch_size, total) / total)
@@ -326,39 +255,25 @@ with colA:
 
     if st.button("Baixar modelo de planilha"):
         sample_rows = [
-            {"numPrj": 101, "mesAno": "07/2025", "codFpj": 1, "ctaFin": 1002, "codCcu": "1002", "vlrCpf": 15000.00, "vlrCxf": 0.00},
-            {"numPrj": 101, "mesAno": "08/2025", "codFpj": 1, "ctaFin": 1002, "codCcu": "1002", "vlrCpf": 20000.00, "vlrCxf": 0.00},
+            {"numPrj":101,"mesAno":"07/2025","codFpj":1,"ctaFin":1002,"codCcu":"1002","vlrCpf":15000.00,"vlrCxf":0.00},
+            {"numPrj":101,"mesAno":"08/2025","codFpj":1,"ctaFin":1002,"codCcu":"1002","vlrCpf":20000.00,"vlrCxf":0.00},
         ]
-
         if HAS_PANDAS and HAS_OPENPYXL:
             df_sample = pd.DataFrame(sample_rows)
             bio = io.BytesIO()
             with pd.ExcelWriter(bio, engine="openpyxl") as w:
                 df_sample.to_excel(w, index=False)
-            st.download_button(
-                "Download sample_orcamento.xlsx",
-                data=bio.getvalue(),
-                file_name="sample_orcamento.xlsx",
-            )
+            st.download_button("Download sample_orcamento.xlsx", data=bio.getvalue(), file_name="sample_orcamento.xlsx")
         else:
-            # fallback CSV
             if HAS_PANDAS:
                 df_sample = pd.DataFrame(sample_rows)
                 csv_bytes = df_sample.to_csv(index=False, sep=";").encode("utf-8")
             else:
                 header = ";".join(REQUIRED_COLUMNS)
-                lines = [header]
-                for r in sample_rows:
-                    line = ";".join(str(r[c]) for c in REQUIRED_COLUMNS)
-                    lines.append(line)
+                lines = [header] + [";".join(str(r[c]) for c in REQUIRED_COLUMNS) for r in sample_rows]
                 csv_bytes = ("\n".join(lines)).encode("utf-8")
-
             st.warning("openpyxl indisponível: gerando CSV como alternativa.")
-            st.download_button(
-                "Download sample_orcamento.csv",
-                data=csv_bytes,
-                file_name="sample_orcamento.csv",
-            )
+            st.download_button("Download sample_orcamento.csv", data=csv_bytes, file_name="sample_orcamento.csv")
 
 with colB:
     st.subheader("Acesso")
@@ -379,12 +294,8 @@ if st.button("Validar planilha"):
     else:
         try:
             df_like = read_table(up)
-            if HAS_PANDAS:
-                st.success(f"Planilha válida! Registros: {len(df_like)}")
-                st.dataframe(df_like.head(10))
-            else:
-                st.success(f"CSV válido! Registros: {len(df_like)}")
-                st.json(df_like[:5])
+            st.success(f"Planilha válida! Registros: {len(df_like)}")
+            (st.dataframe(df_like.head(10)) if HAS_PANDAS else st.json(df_like[:5]))
         except Exception as e:
             st.error(f"Erro ao carregar/validar planilha: {e}")
 
@@ -400,46 +311,29 @@ if st.button("Executar importação"):
 
         cfg = {
             "endpoint_soap": ENDPOINT_SOAP,
-            "user": user,
-            "password": password,
-            "encryption": ENCRYPTION,
-            "tipOpe": TIP_OPE,
-            "codEmp": codEmp,
-            "lctSup": LCT_SUP,
+            "user": user, "password": password,
+            "encryption": ENCRYPTION, "tipOpe": TIP_OPE,
+            "codEmp": codEmp, "lctSup": LCT_SUP,
             "recalculaTotalizadores": RECALCULA_TOTALIZADORES,
             "timeout": TIMEOUT,
         }
 
         ok, log_rows, xml_outputs = run_import(df_like, cfg, batch_size=BATCH_SIZE, simulate=simulate)
 
-        # gera CSV do log
+        # Log CSV
         csv_buf = io.StringIO()
         for row in log_rows:
             csv_buf.write(";".join([str(x) if x is not None else "" for x in row]) + "\n")
-
-        st.download_button(
-            "Baixar envio_log.csv",
-            data=csv_buf.getvalue().encode("utf-8"),
-            file_name="envio_log.csv",
-        )
+        st.download_button("Baixar envio_log.csv", data=csv_buf.getvalue().encode("utf-8"), file_name="envio_log.csv")
 
         st.success(f"Concluído. Lotes {'simulados' if simulate else 'OK'}: {ok}/{math.ceil(len(df_to_records(df_like)) / BATCH_SIZE)}")
 
-        # Se simulou, oferece ZIP com XMLs
         if simulate and xml_outputs:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
                 for num_lote, xml_bytes in xml_outputs:
                     zf.writestr(f"lote_{num_lote:03d}.xml", xml_bytes)
-            st.download_button(
-                "Baixar XMLs (ZIP)",
-                data=zip_buf.getvalue(),
-                file_name="lotes_xml.zip",
-                mime="application/zip",
-            )
+            st.download_button("Baixar XMLs (ZIP)", data=zip_buf.getvalue(), file_name="lotes_xml.zip", mime="application/zip")
 
         if not simulate:
-            st.info(
-                "Se aparecer erro de conexão aqui no Cloud, teste o mesmo XML dentro da sua rede Senior. "
-                "Alguns ambientes não aceitam tráfego externo/porta 30401."
-            )
+            st.info("Se der erro de conexão no Cloud, teste o mesmo XML de dentro da rede Senior (porta 30401).")
