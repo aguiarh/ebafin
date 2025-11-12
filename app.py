@@ -1,5 +1,10 @@
+# EBAFIN – Importador de Orçamento Financeiro (Streamlit Cloud)
 
-## app.py
+Abaixo estão **todos os arquivos** para rodar no Streamlit Cloud: `app.py`, `requirements.txt` e `runtime.txt`. Incluí um **Painel de Diagnóstico** embutido (toggle no topo) pra checar se `openpyxl`/`pandas` estão realmente disponíveis no container e para listar arquivos do diretório.
+
+---
+
+## app.py (com Painel de Diagnóstico e fallback CSV)
 
 ```python
 #!/usr/bin/env python3
@@ -7,9 +12,12 @@
 """
 EBAFIN – Importador de Orçamento Financeiro
 Layout: Upload à esquerda, Acesso à direita
-Blindado para rodar no Streamlit Cloud (Python 3.13) com fallbacks
+Blindado para rodar no Streamlit Cloud (Python 3.13) com fallbacks + Painel de Diagnóstico
 """
 import io
+import os
+import sys
+import platform
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -57,6 +65,21 @@ REQUIRED_COLUMNS = [
 st.set_page_config(page_title="Importador de Orçamento – EBAFIN", layout="wide")
 st.title("Importador de Orçamento – EBAFIN (Senior ERP)")
 st.caption("Produção: informe usuário, senha, empresa e a planilha. Upload à esquerda, acesso à direita.")
+
+show_diag = st.toggle("🔎 Mostrar Painel de Diagnóstico", value=False)
+if show_diag:
+    st.subheader("Painel de Diagnóstico do Container")
+    st.write("Python:", sys.version)
+    st.write("Plataforma:", platform.platform())
+    st.write("HAS_PANDAS:", HAS_PANDAS, "HAS_XLSX:", HAS_XLSX)
+    st.write("Arquivos no diretório:", os.listdir("."))
+    try:
+        import importlib.metadata as im
+        pkgs = {d.metadata["Name"]: d.version for d in im.distributions()}
+        st.write("Pacotes instalados (top 30):", dict(list(sorted(pkgs.items()))[:30]))
+        st.info("Se 'openpyxl' não aparece aqui, o requirements.txt não entrou no build.")
+    except Exception as e:
+        st.warning(f"Falha ao listar pacotes: {e}")
 
 # =========================
 # Helpers
@@ -322,7 +345,8 @@ with colA:
                 for r in sample_rows:
                     line = ";".join(str(r[c]) for c in REQUIRED_COLUMNS)
                     lines.append(line)
-                csv_bytes = ("\n".join(lines)).encode("utf-8")
+                csv_bytes = ("
+".join(lines)).encode("utf-8")
 
             st.warning("openpyxl ausente: gerando CSV como alternativa.")
             st.download_button(
@@ -385,7 +409,8 @@ if st.button("Executar importação"):
         # gera CSV do log
         csv_buf = io.StringIO()
         for row in log_rows:
-            csv_buf.write(";".join([str(x) if x is not None else "" for x in row]) + "\n")
+            csv_buf.write(";".join([str(x) if x is not None else "" for x in row]) + "
+")
 
         st.download_button(
             "Baixar envio_log.csv",
@@ -408,18 +433,17 @@ if st.button("Executar importação"):
 ```text
 streamlit==1.37.1
 pandas==2.2.2
+numpy==1.26.4
 requests==2.32.3
 PyYAML==6.0.2
 openpyxl==3.1.5
 ```
 
-> Observação: mesmo se você não usar YAML, deixar o `PyYAML` evita quebrar caso importe depois.
+> Incluí `numpy` explicitamente (o `pandas` puxa, mas ajuda o resolver do Cloud) e mantive `openpyxl`.
 
 ---
 
 ## runtime.txt (opcional)
-
-> O Streamlit Cloud pode ignorar este arquivo em alguns planos. Mantive aqui caso seja respeitado.
 
 ```text
 python-3.12.3
@@ -432,5 +456,6 @@ Se o Cloud continuar mostrando Python 3.13.9 no log, tudo bem – o `requirement
 ### Checklist rápido
 
 * Commit e push destes **3 arquivos** na raiz do repo.
-* No Streamlit Cloud: *Manage app → Restart*.
-* Se o erro for de **conexão** na hora do envio: é reachability/porta do endpoint (30401). Aí teste na sua rede ou exponha via 443.
+* *Manage app → Restart* no Streamlit Cloud.
+* Ative o **“🔎 Mostrar Painel de Diagnóstico”** na página e confira se `openpyxl` aparece na lista de pacotes.
+* Se não aparecer: o Cloud está usando outro `requirements.txt` (pasta errada, nome diferente) – verifique caminho/branch.
