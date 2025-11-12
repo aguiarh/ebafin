@@ -4,40 +4,59 @@ Abaixo estão **todos os arquivos** para rodar no Streamlit Cloud: `app.py`, `re
 
 ---
 
-## app.py (com Painel de Diagnóstico e fallback CSV)
+## app.py
 
 ```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EBAFIN – Importador de Orçamento Financeiro
-Layout: Upload à esquerda, Acesso à direita
-Blindado para rodar no Streamlit Cloud (Python 3.13) com fallbacks + Painel de Diagnóstico
+EBAFIN – Importador de Orçamento Financeiro (Senior ERP)
+- Layout: Upload à esquerda, Acesso à direita
+- Painel de diagnóstico embutido
+- Fallback CSV quando openpyxl não está disponível
+- "Modo simulado" para gerar/baixar os XMLs em vez de enviar (útil no Streamlit Cloud)
+- Auto-instalação de openpyxl em runtime (quando possível)
 """
 import io
 import os
 import sys
 import platform
+import math
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
+import zipfile
 
 import streamlit as st
 import requests
 
-# Dependências opcionais: pandas / openpyxl
-# Mantemos o app funcional mesmo sem elas (fallback para CSV)
+# ---------------- Garantia de ambiente (apenas p/ Cloud) ----------------
+# Tenta instalar openpyxl em runtime caso não esteja presente
+
+def _ensure(pkg, ver=None):
+    try:
+        __import__(pkg)
+        return True
+    except Exception:
+        target = f"{pkg}=={ver}" if ver else pkg
+        try:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", target])
+            __import__(pkg)
+            return True
+        except Exception as e:
+            st.warning(f"Não foi possível instalar {target} em runtime: {e}")
+            return False
+
+HAS_OPENPYXL = _ensure("openpyxl", "3.1.5")
+
+# pandas costuma já estar, mas garantimos import amigável
 try:
     import pandas as pd  # type: ignore
     HAS_PANDAS = True
-except Exception:
+except Exception as e:
     HAS_PANDAS = False
-
-try:
-    import openpyxl  # noqa: F401  # type: ignore
-    HAS_XLSX = True
-except Exception:
-    HAS_XLSX = False
+    st.error("Pandas não disponível no servidor. Envie CSV simples (.csv/.txt) ou ajuste requirements.txt")
 
 # =========================
 # CONFIG FIXA (produção)
@@ -66,24 +85,22 @@ st.set_page_config(page_title="Importador de Orçamento – EBAFIN", layout="wid
 st.title("Importador de Orçamento – EBAFIN (Senior ERP)")
 st.caption("Produção: informe usuário, senha, empresa e a planilha. Upload à esquerda, acesso à direita.")
 
-show_diag = st.toggle("🔎 Mostrar Painel de Diagnóstico", value=False)
-if show_diag:
-    st.subheader("Painel de Diagnóstico do Container")
+with st.expander("🔎 Painel de Diagnóstico", expanded=False):
     st.write("Python:", sys.version)
     st.write("Plataforma:", platform.platform())
-    st.write("HAS_PANDAS:", HAS_PANDAS, "HAS_XLSX:", HAS_XLSX)
+    st.write("HAS_PANDAS:", HAS_PANDAS, "HAS_OPENPYXL:", HAS_OPENPYXL)
     st.write("Arquivos no diretório:", os.listdir("."))
     try:
         import importlib.metadata as im
         pkgs = {d.metadata["Name"]: d.version for d in im.distributions()}
-        st.write("Pacotes instalados (top 30):", dict(list(sorted(pkgs.items()))[:30]))
-        st.info("Se 'openpyxl' não aparece aqui, o requirements.txt não entrou no build.")
+        st.write("Pacotes instalados (amostra):", dict(list(sorted(pkgs.items()))[:40]))
     except Exception as e:
         st.warning(f"Falha ao listar pacotes: {e}")
 
 # =========================
 # Helpers
 # =========================
+
 def normalize_number_series(series):
     # Converte strings com separador de milhar/decimal BR para float
     return (
@@ -106,9 +123,9 @@ def read_table(uploaded_file):
 
     if HAS_PANDAS:
         if name.endswith((".xlsx", ".xls")):
-            if not HAS_XLSX:
+            if not HAS_OPENPYXL:
                 raise ValueError(
-                    "Arquivo Excel enviado, mas o servidor não tem openpyxl. "
+                    "Arquivo Excel enviado, mas openpyxl não está disponível. "
                     "Instale openpyxl no requirements.txt ou envie CSV."
                 )
             df = pd.read_excel(uploaded_file)
@@ -158,17 +175,19 @@ def read_table(uploaded_file):
 # -------------------------
 # XML builders
 # -------------------------
-def build_item(row):
-    def get_val(x, k):
-        if HAS_PANDAS:
-            # pandas Series
-            return ("" if pd.isna(x.get(k)) else str(x.get(k)))
-        return str(x.get(k, ""))
 
+def _val_from_row(x, k):
+    if HAS_PANDAS:
+        import pandas as pd  # local
+        return ("" if pd.isna(x.get(k)) else str(x.get(k)))
+    return str(x.get(k, ""))
+
+
+def build_item(row):
     item = ET.Element("orcamentoFinanceiroLista")
     for tag in REQUIRED_COLUMNS:
         el = ET.SubElement(item, tag)
-        el.text = get_val(row, tag)
+        el.text = _val_from_row(row, tag)
     return item
 
 
@@ -234,11 +253,10 @@ def parse_response(content: bytes):
 def df_to_records(df):
     if HAS_PANDAS:
         return df.to_dict("records")
-    # já está em records (fallback CSV)
-    return df
+    return df  # já é lista de dicts no fallback
 
 
-def run_import(df_like, cfg, batch_size):
+def run_import(df_like, cfg, batch_size, simulate=False):
     endpoint = cfg["endpoint_soap"].strip()
     records = df_to_records(df_like)
     total = len(records)
@@ -251,18 +269,28 @@ def run_import(df_like, cfg, batch_size):
     progress = st.progress(0)
     status_box = st.empty()
 
+    # buffer para XMLs (modo simulado)
+    xml_outputs = []
+
     for i in range(0, total, batch_size):
         lote_idx = i // batch_size + 1
         chunk = records[i : i + batch_size]
 
         try:
             payload = build_envelope(cfg, chunk)
-            resp = post_batch(endpoint, payload, timeout=int(cfg["timeout"]))
-            info = parse_response(resp.content)
 
-            status = "OK"
-            if (info.get("resultado") or "").upper() != "OK" or info.get("erro_execucao"):
-                status = "ERRO"
+            if simulate:
+                # guarda para download e considera OK
+                xml_outputs.append((lote_idx, payload))
+                status = "OK"
+                info = {"resultado": "OK", "erro_execucao": None, "mensagem": "SIMULADO", "grid_erros": []}
+            else:
+                resp = post_batch(endpoint, payload, timeout=int(cfg["timeout"]))
+                info = parse_response(resp.content)
+                status = "OK"
+                if (info.get("resultado") or "").upper() != "OK" or info.get("erro_execucao"):
+                    status = "ERRO"
+
             if status == "OK":
                 ok_batches += 1
 
@@ -275,7 +303,7 @@ def run_import(df_like, cfg, batch_size):
                 info.get("mensagem"),
                 " | ".join(info.get("grid_erros") or []),
             ])
-            status_box.info(f"Lote {lote_idx} enviado.")
+            status_box.info(f"Lote {lote_idx} {'simulado' if simulate else 'enviado'}.")
         except Exception as e:
             log_rows.append([
                 datetime.now().isoformat(timespec="seconds"),
@@ -290,7 +318,7 @@ def run_import(df_like, cfg, batch_size):
 
         progress.progress(min(i + batch_size, total) / total)
 
-    return ok_batches, log_rows
+    return ok_batches, log_rows, xml_outputs
 
 
 # =========================
@@ -304,27 +332,11 @@ with colA:
 
     if st.button("Baixar modelo de planilha"):
         sample_rows = [
-            {
-                "numPrj": 101,
-                "mesAno": "07/2025",
-                "codFpj": 1,
-                "ctaFin": 1002,
-                "codCcu": "1002",
-                "vlrCpf": 15000.00,
-                "vlrCxf": 0.00,
-            },
-            {
-                "numPrj": 101,
-                "mesAno": "08/2025",
-                "codFpj": 1,
-                "ctaFin": 1002,
-                "codCcu": "1002",
-                "vlrCpf": 20000.00,
-                "vlrCxf": 0.00,
-            },
+            {"numPrj": 101, "mesAno": "07/2025", "codFpj": 1, "ctaFin": 1002, "codCcu": "1002", "vlrCpf": 15000.00, "vlrCxf": 0.00},
+            {"numPrj": 101, "mesAno": "08/2025", "codFpj": 1, "ctaFin": 1002, "codCcu": "1002", "vlrCpf": 20000.00, "vlrCxf": 0.00},
         ]
 
-        if HAS_PANDAS and HAS_XLSX:
+        if HAS_PANDAS and HAS_OPENPYXL:
             df_sample = pd.DataFrame(sample_rows)
             bio = io.BytesIO()
             with pd.ExcelWriter(bio, engine="openpyxl") as w:
@@ -348,7 +360,7 @@ with colA:
                 csv_bytes = ("
 ".join(lines)).encode("utf-8")
 
-            st.warning("openpyxl ausente: gerando CSV como alternativa.")
+            st.warning("openpyxl indisponível: gerando CSV como alternativa.")
             st.download_button(
                 "Download sample_orcamento.csv",
                 data=csv_bytes,
@@ -360,6 +372,7 @@ with colB:
     user = st.text_input("Usuário do WebService", "webservice")
     password = st.text_input("Senha", "Agro@2024", type="password")
     codEmp = st.text_input("Código da Empresa", "70")
+    simulate = st.checkbox("Modo simulado (não envia, gera XML)", value=True)
     st.caption("As demais configurações estão fixas no código.")
 
 normalize_numbers = st.checkbox("Normalizar números (trocar , por .)", value=True)
@@ -404,7 +417,7 @@ if st.button("Executar importação"):
             "timeout": TIMEOUT,
         }
 
-        ok, log_rows = run_import(df_like, cfg, batch_size=BATCH_SIZE)
+        ok, log_rows, xml_outputs = run_import(df_like, cfg, batch_size=BATCH_SIZE, simulate=simulate)
 
         # gera CSV do log
         csv_buf = io.StringIO()
@@ -418,26 +431,37 @@ if st.button("Executar importação"):
             file_name="envio_log.csv",
         )
 
-        import math
-        st.success(f"Concluído. Lotes OK: {ok}/{math.ceil(len(df_to_records(df_like)) / BATCH_SIZE)}")
-        st.info(
-            "Se aparecer erro de conexão aqui no Cloud, teste o mesmo XML dentro da sua rede Senior. "
-            "Alguns ambientes não aceitam tráfego externo/porta 30401."
-        )
+        st.success(f"Concluído. Lotes {'simulados' if simulate else 'OK'}: {ok}/{math.ceil(len(df_to_records(df_like)) / BATCH_SIZE)}")
+
+        # Se simulou, oferece ZIP com XMLs
+        if simulate and xml_outputs:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for num_lote, xml_bytes in xml_outputs:
+                    zf.writestr(f"lote_{num_lote:03d}.xml", xml_bytes)
+            st.download_button(
+                "Baixar XMLs (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name="lotes_xml.zip",
+                mime="application/zip",
+            )
+
+        if not simulate:
+            st.info(
+                "Se aparecer erro de conexão aqui no Cloud, teste o mesmo XML dentro da sua rede Senior. "
+                "Alguns ambientes não aceitam tráfego externo/porta 30401."
+            )
 ```
 
----
-
-## requirements.txt
-
-```text
+text
 streamlit==1.37.1
 pandas==2.2.2
 numpy==1.26.4
 requests==2.32.3
 PyYAML==6.0.2
 openpyxl==3.1.5
-```
+
+````
 
 > Incluí `numpy` explicitamente (o `pandas` puxa, mas ajuda o resolver do Cloud) e mantive `openpyxl`.
 
@@ -447,7 +471,7 @@ openpyxl==3.1.5
 
 ```text
 python-3.12.3
-```
+````
 
 Se o Cloud continuar mostrando Python 3.13.9 no log, tudo bem – o `requirements.txt` acima já é compatível.
 
