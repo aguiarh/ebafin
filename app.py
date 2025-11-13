@@ -54,7 +54,7 @@ HAS_PANDAS = True  # já importado acima; se falhar, paramos no try/except
 # CONFIG FIXA (produção)
 # =========================
 ENDPOINT_SOAP = (
-    "https://web130.seniorcloud.com.br:30401/"
+    "https://https://web36.seniorcloud.com.br:40301/"
     "g5-senior-services/sapiens_Synccom_senior_g5_co_mfi_prj_gerarorcamentofinanceirogrid"
 )
 ENCRYPTION = "0"
